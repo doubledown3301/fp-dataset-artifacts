@@ -9,6 +9,19 @@ import json
 
 NUM_PREPROCESSING_WORKERS = 2
 
+def prepare_dataset_nli_hypothesis_only(examples, tokenizer, max_length):
+    """
+    Preprocessing function for hypothesis-only training (bias model).
+    Only tokenizes the hypothesis, not the premise.
+    """
+    tokenized = tokenizer(
+        examples['hypothesis'],
+        max_length=max_length,
+        truncation=True,
+        padding='max_length'
+    )
+    tokenized['label'] = examples['label']
+    return tokenized
 
 def main():
     argp = HfArgumentParser(TrainingArguments)
@@ -47,6 +60,8 @@ def main():
                       help='Limit the number of examples to train on.')
     argp.add_argument('--max_eval_samples', type=int, default=None,
                       help='Limit the number of examples to evaluate on.')
+    argp.add_argument('--hypothesis_only', action='store_true',
+                      help='Train on hypothesis only (for bias model).')
 
     training_args, args = argp.parse_args_into_dataclasses()
 
@@ -93,9 +108,14 @@ def main():
         prepare_train_dataset = lambda exs: prepare_train_dataset_qa(exs, tokenizer)
         prepare_eval_dataset = lambda exs: prepare_validation_dataset_qa(exs, tokenizer)
     elif args.task == 'nli':
-        prepare_train_dataset = prepare_eval_dataset = \
-            lambda exs: prepare_dataset_nli(exs, tokenizer, args.max_length)
-        # prepare_eval_dataset = prepare_dataset_nli
+        if args.hypothesis_only:
+            # For bias model: only use hypothesis
+            prepare_train_dataset = prepare_eval_dataset = \
+                lambda exs: prepare_dataset_nli_hypothesis_only(exs, tokenizer, args.max_length)
+        else:
+            prepare_train_dataset = prepare_eval_dataset = \
+                lambda exs: prepare_dataset_nli(exs, tokenizer, args.max_length)
+            # prepare_eval_dataset = prepare_dataset_nli
     else:
         raise ValueError('Unrecognized task name: {}'.format(args.task))
 
