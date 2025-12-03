@@ -149,6 +149,8 @@ def main():
             for param in bias_model.electra.parameters():
                 if not param.is_contiguous():
                     param.data = param.data.contiguous()
+        # Move bias model to the same device as the main model
+        bias_model = bias_model.to(model.device)
 
     # Select the dataset preprocessing function (these functions are defined in helpers.py)
     if args.task == 'qa':
