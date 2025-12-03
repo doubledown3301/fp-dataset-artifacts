@@ -23,6 +23,39 @@ def prepare_dataset_nli_hypothesis_only(examples, tokenizer, max_length):
     tokenized['label'] = examples['label']
     return tokenized
 
+class DebiasedTrainer(Trainer):
+    
+    def __init__(self, *args, bias_model=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bias_model = bias_model
+        
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        
+        if self.bias_model is not None:
+            # Get bias model predictions
+            with torch.no_grad():
+                bias_outputs = self.bias_model(**inputs)
+                bias_probs = F.softmax(bias_outputs.logits, dim=-1)
+                bias_confidence = bias_probs.max(dim=-1)[0]
+            
+            # Reweight loss: downweight examples where bias model is confident
+            # Weight = 1 / (1 + bias_confidence)
+            weights = 1.0 / (1.0 + bias_confidence)
+            
+            # Compute weighted cross-entropy loss
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+            loss = (loss * weights).mean()
+        else:
+            # Standard loss
+            loss_fct = torch.nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        
+        return (loss, outputs) if return_outputs else loss
+
 def main():
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
@@ -62,6 +95,8 @@ def main():
                       help='Limit the number of examples to evaluate on.')
     argp.add_argument('--hypothesis_only', action='store_true',
                       help='Train on hypothesis only (for bias model).')
+    argp.add_argument('--bias_model_path', type=str, default=None,
+                      help='Path to bias model for ensemble debiasing.')
 
     training_args, args = argp.parse_args_into_dataclasses()
 
@@ -102,6 +137,16 @@ def main():
             if not param.is_contiguous():
                 param.data = param.data.contiguous()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+
+    bias_model = None
+    if args.bias_model_path:
+        print(f"Loading bias model from {args.bias_model_path}")
+        bias_model = model_class.from_pretrained(args.bias_model_path, **task_kwargs)
+        bias_model.eval()
+        if hasattr(bias_model, 'electra'):
+            for param in bias_model.electra.parameters():
+                if not param.is_contiguous():
+                    param.data = param.data.contiguous()
 
     # Select the dataset preprocessing function (these functions are defined in helpers.py)
     if args.task == 'qa':
@@ -175,15 +220,26 @@ def main():
         eval_predictions = eval_preds
         return compute_metrics(eval_preds)
 
-    # Initialize the Trainer object with the specified arguments and the model and dataset we loaded above
-    trainer = trainer_class(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset_featurized,
-        eval_dataset=eval_dataset_featurized,
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics_and_store_predictions
-    )
+    if args.bias_model_path:
+        trainer = DebiasedTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset_featurized,
+            eval_dataset=eval_dataset_featurized,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics_and_store_predictions,
+            bias_model=bias_model
+        )
+    else:
+        trainer = trainer_class(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset_featurized,
+            eval_dataset=eval_dataset_featurized,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics_and_store_predictions
+        )
+    
     # Train and/or evaluate
     if training_args.do_train:
         trainer.train()
