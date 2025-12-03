@@ -30,6 +30,7 @@ class DebiasedTrainer(Trainer):
     def __init__(self, *args, bias_model=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.bias_model = bias_model
+        self.bias_model_moved = False  # Track if we've moved bias model to GPU
         
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
@@ -37,6 +38,12 @@ class DebiasedTrainer(Trainer):
         logits = outputs.logits
         
         if self.bias_model is not None:
+            # Move bias model to same device as inputs (only do this once)
+            if not self.bias_model_moved:
+                device = next(model.parameters()).device
+                self.bias_model = self.bias_model.to(device)
+                self.bias_model_moved = True
+            
             # Get bias model predictions
             with torch.no_grad():
                 bias_outputs = self.bias_model(**inputs)
