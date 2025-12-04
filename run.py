@@ -397,7 +397,17 @@ def main():
     
     # Train and/or evaluate
     if training_args.do_train:
-        trainer.train()
+        # Check for existing checkpoints to resume from, total life saver so I don't keep rerunning from the beginning
+        checkpoint = None
+        if os.path.isdir(training_args.output_dir):
+            checkpoints = [d for d in os.listdir(training_args.output_dir) 
+                          if d.startswith('checkpoint-')]
+            if checkpoints:
+                checkpoints.sort(key=lambda x: int(x.split('-')[1]))
+                checkpoint = os.path.join(training_args.output_dir, checkpoints[-1])
+                print(f"🔄 Resuming from checkpoint: {checkpoint}")
+    
+        trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()
         # If you want to customize the way the loss is computed, you should subclass Trainer and override the "compute_loss"
         # method (see https://huggingface.co/transformers/_modules/transformers/trainer.html#Trainer.compute_loss).
