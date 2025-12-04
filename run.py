@@ -118,9 +118,18 @@ def analyze_overlap(predictions_file, output_file=None):
                 label_names[i]: float(df[df['label'] == i]['correct'].mean())
                 for i in range(3)
             },
-            'accuracy_by_quartile': quartile_results,
+            'accuracy_by_quartile': [
+                {
+                    'quartile': str(qr['quartile']),
+                    'accuracy': float(qr['accuracy']),
+                    'min_overlap': float(qr['min_overlap']),
+                    'max_overlap': float(qr['max_overlap']),
+                    'count': int(qr['count'])
+                }
+                for qr in quartile_results
+            ],
             'overlap_gap': float(gap),
-            'artifact_detected': abs(gap) > 0.02
+            'artifact_detected': bool(abs(gap) > 0.02)
         }
         
         with open(output_file, 'w') as f:
