@@ -17,9 +17,9 @@ def check_versions():
     """
     Print version information for PyTorch and Transformers, and check CUDA availability.
     """
-    print("=" * 20)
-    print("Pytorch info and Cuda Info")
-    print("=" * 20)
+    print("=" * 60)
+    print("ENVIRONMENT INFORMATION")
+    print("=" * 60)
     print(f"PyTorch version:      {torch.__version__}")
     print(f"Transformers version: {transformers.__version__}")
     print(f"CUDA available:       {torch.cuda.is_available()}")
@@ -28,7 +28,111 @@ def check_versions():
         print(f"GPU device count:     {torch.cuda.device_count()}")
         print(f"Current GPU device:   {torch.cuda.current_device()}")
         print(f"GPU device name:      {torch.cuda.get_device_name(0)}")
-    print("=" * 20)
+    print("=" * 60)
+
+
+def analyze_overlap(predictions_file, output_file=None):
+    """
+    Analyze lexical overlap artifact in predictions.
+    Computes word overlap and accuracy by overlap quartiles.
+    """
+    import pandas as pd
+    
+    print("=" * 60)
+    print("LEXICAL OVERLAP ANALYSIS")
+    print("=" * 60)
+    
+    # Load predictions
+    predictions = []
+    with open(predictions_file, 'r') as f:
+        for line in f:
+            predictions.append(json.loads(line))
+    
+    print(f"Loaded {len(predictions)} predictions\n")
+    
+    # Calculate word overlap
+    def word_overlap(premise, hypothesis):
+        p_words = set(premise.lower().split())
+        h_words = set(hypothesis.lower().split())
+        if len(h_words) == 0:
+            return 0.0
+        return len(p_words & h_words) / len(h_words)
+    
+    for pred in predictions:
+        pred['overlap'] = word_overlap(pred['premise'], pred['hypothesis'])
+        pred['correct'] = (pred['label'] == pred['predicted_label'])
+    
+    df = pd.DataFrame(predictions)
+    
+    # Overall accuracy
+    overall_acc = df['correct'].mean()
+    print(f"Overall Accuracy: {overall_acc:.4f} ({df['correct'].sum()}/{len(df)})\n")
+    
+    # Accuracy by label
+    print("Accuracy by Label:")
+    label_names = ['Entailment', 'Neutral', 'Contradiction']
+    for label in [0, 1, 2]:
+        subset = df[df['label'] == label]
+        acc = subset['correct'].mean()
+        avg_overlap = subset['overlap'].mean()
+        print(f"  {label_names[label]:13s}: {acc:.4f} (avg overlap: {avg_overlap:.3f})")
+    
+    # Accuracy by overlap quartiles
+    print("\nAccuracy by Overlap Quartile:")
+    df['overlap_quartile'] = pd.qcut(df['overlap'], q=4, labels=['Q1 (Low)', 'Q2', 'Q3', 'Q4 (High)'], duplicates='drop')
+    
+    quartile_results = []
+    for quartile in df['overlap_quartile'].unique():
+        subset = df[df['overlap_quartile'] == quartile]
+        acc = subset['correct'].mean()
+        min_overlap = subset['overlap'].min()
+        max_overlap = subset['overlap'].max()
+        count = len(subset)
+        print(f"  {quartile:11s}: {acc:.4f} ({min_overlap:.2f}-{max_overlap:.2f} overlap, n={count})")
+        quartile_results.append({
+            'quartile': quartile,
+            'accuracy': acc,
+            'min_overlap': min_overlap,
+            'max_overlap': max_overlap,
+            'count': count
+        })
+    
+    # Check for artifact (accuracy gap between high/low overlap)
+    low_overlap_acc = df[df['overlap_quartile'] == 'Q1 (Low)']['correct'].mean()
+    high_overlap_acc = df[df['overlap_quartile'] == 'Q4 (High)']['correct'].mean()
+    gap = high_overlap_acc - low_overlap_acc
+    
+    print(f"\nOverlap Artifact Analysis:")
+    print(f"  High overlap (Q4) accuracy: {high_overlap_acc:.4f}")
+    print(f"  Low overlap (Q1) accuracy:  {low_overlap_acc:.4f}")
+    print(f"  Accuracy gap:                {gap:+.4f} ({gap*100:+.2f} percentage points)")
+    
+    if abs(gap) > 0.02:
+        print(f"  ⚠️  Significant overlap artifact detected!")
+    else:
+        print(f"  ✓ Minimal overlap artifact")
+    
+    print("=" * 60)
+    
+    # Save results if output file specified
+    if output_file:
+        results = {
+            'overall_accuracy': float(overall_acc),
+            'accuracy_by_label': {
+                label_names[i]: float(df[df['label'] == i]['correct'].mean())
+                for i in range(3)
+            },
+            'accuracy_by_quartile': quartile_results,
+            'overlap_gap': float(gap),
+            'artifact_detected': abs(gap) > 0.02
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"\nResults saved to: {output_file}")
+    
+    return df
 
 
 def prepare_dataset_nli_hypothesis_only(examples, tokenizer, max_length):
@@ -92,6 +196,23 @@ def main():
         check_versions()
         return
     
+    # Check for analyze_overlap flag early
+    if '--analyze_overlap' in sys.argv:
+        idx = sys.argv.index('--analyze_overlap')
+        if idx + 1 < len(sys.argv):
+            predictions_file = sys.argv[idx + 1]
+            # Check for optional output file
+            output_file = None
+            if '--analysis_output' in sys.argv:
+                output_idx = sys.argv.index('--analysis_output')
+                if output_idx + 1 < len(sys.argv):
+                    output_file = sys.argv[output_idx + 1]
+            analyze_overlap(predictions_file, output_file)
+        else:
+            print("Error: --analyze_overlap requires a predictions file path")
+            print("Usage: python run.py --analyze_overlap <predictions.jsonl> [--analysis_output <output.json>]")
+        return
+    
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
     # In particular, TrainingArguments has several keys that you'll need/want to specify (when you call run.py from the command line):
@@ -112,6 +233,10 @@ def main():
 
     argp.add_argument('--check_versions', action='store_true',
                       help='Print version information and exit.')
+    argp.add_argument('--analyze_overlap', type=str, default=None,
+                      help='Analyze lexical overlap in predictions file and exit.')
+    argp.add_argument('--analysis_output', type=str, default=None,
+                      help='Optional: Save analysis results to JSON file.')
     argp.add_argument('--model', type=str,
                       default='google/electra-small-discriminator',
                       help="""This argument specifies the base model to fine-tune.
