@@ -194,7 +194,8 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     
     # Load model and tokenizer
     print(f"Loading model from: {model_path}")
-    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    # Ensure we're loading from local path by using local_files_only=True
+    model = AutoModelForSequenceClassification.from_pretrained(model_path, local_files_only=True)
     tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
     
     # Load SNLI test set
