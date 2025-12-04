@@ -10,6 +10,8 @@ import json
 import torch
 import torch.nn.functional as F
 import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 
 NUM_PREPROCESSING_WORKERS = 2
 
@@ -179,11 +181,162 @@ class DebiasedTrainer(Trainer):
         
         return (loss, outputs) if return_outputs else loss
 
+def evaluate_bias_model(model_path, output_dir, max_length=128):
+    """
+    Evaluate hypothesis-only bias model on SNLI test set.
+    
+    Args:
+        model_path: Path to trained hypothesis-only model
+        output_dir: Directory to save evaluation results and predictions
+        max_length: Maximum sequence length for tokenization
+    """
+    print_title("Evaluating Hypothesis-Only Bias Model")
+    
+    # Load model and tokenizer
+    print(f"Loading model from: {model_path}")
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
+    
+    # Load SNLI test set
+    print("Loading SNLI test dataset...")
+    dataset = datasets.load_dataset("snli")
+    test_dataset = dataset["test"].filter(lambda x: x["label"] != -1)
+    print(f"Test examples: {len(test_dataset)}")
+    
+    # Tokenize hypothesis only
+    def tokenize_hypothesis_only(examples):
+        tokenized = tokenizer(
+            examples["hypothesis"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )
+        tokenized['label'] = examples['label']
+        return tokenized
+    
+    print("Tokenizing test dataset...")
+    tokenized_test = test_dataset.map(
+        tokenize_hypothesis_only, 
+        batched=True,
+        num_proc=NUM_PREPROCESSING_WORKERS,
+        remove_columns=test_dataset.column_names
+    )
+    
+    # Define compute_metrics function
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        predictions = np.argmax(predictions, axis=1)
+        
+        accuracy = accuracy_score(labels, predictions)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, predictions, average='weighted'
+        )
+        
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }
+    
+    # Create Trainer for evaluation
+    print("Running evaluation...")
+    trainer = Trainer(
+        model=model,
+        tokenizer=tokenizer,
+        compute_metrics=compute_metrics
+    )
+    
+    # Evaluate on test set
+    results = trainer.evaluate(tokenized_test)
+    
+    print("\n" + "=" * 50)
+    print("HYPOTHESIS-ONLY BIAS MODEL RESULTS")
+    print("=" * 50)
+    print(f"Test Accuracy:  {results['eval_accuracy']:.4f}")
+    print(f"Test F1:        {results['eval_f1']:.4f}")
+    print(f"Test Precision: {results['eval_precision']:.4f}")
+    print(f"Test Recall:    {results['eval_recall']:.4f}")
+    print("=" * 50)
+    
+    # Get predictions for ensemble use
+    predictions = trainer.predict(tokenized_test)
+    pred_labels = np.argmax(predictions.predictions, axis=1)
+    true_labels = predictions.label_ids
+    
+    # Per-class performance
+    print("\n" + "=" * 50)
+    print("PER-CLASS PERFORMANCE")
+    print("=" * 50)
+    print(classification_report(
+        true_labels, 
+        pred_labels, 
+        target_names=['Entailment', 'Neutral', 'Contradiction'],
+        digits=4
+    ))
+    print("=" * 50)
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save evaluation metrics
+    metrics_file = os.path.join(output_dir, 'bias_model_eval_metrics.json')
+    with open(metrics_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\n✓ Metrics saved to: {metrics_file}")
+    
+    # Save prediction logits (for ensemble debiasing)
+    logits_file = os.path.join(output_dir, 'bias_model_predictions.npy')
+    np.save(logits_file, predictions.predictions)
+    print(f"✓ Prediction logits saved to: {logits_file}")
+    
+    # Save detailed predictions (optional, for analysis)
+    predictions_file = os.path.join(output_dir, 'bias_model_predictions.jsonl')
+    with open(predictions_file, 'w') as f:
+        for i, example in enumerate(test_dataset):
+            pred_data = {
+                'hypothesis': example['hypothesis'],
+                'label': int(example['label']),
+                'predicted_label': int(pred_labels[i]),
+                'predicted_scores': predictions.predictions[i].tolist(),
+                'correct': int(pred_labels[i]) == int(example['label'])
+            }
+            f.write(json.dumps(pred_data) + '\n')
+    print(f"✓ Detailed predictions saved to: {predictions_file}")
+    
+    print_footer()
+    
+    return results
+
 def main():
     # Check for version flag early (before parsing all arguments)
     import sys
     if '--check_versions' in sys.argv:
         check_versions()
+        return
+    
+    # Check for evaluate bias model flag early
+    if '--eval_bias_model' in sys.argv:
+        idx = sys.argv.index('--eval_bias_model')
+        if idx + 1 < len(sys.argv):
+            model_path = sys.argv[idx + 1]
+            # Get output directory
+            output_dir = './bias_model_eval'
+            if '--output_dir' in sys.argv:
+                output_idx = sys.argv.index('--output_dir')
+                if output_idx + 1 < len(sys.argv):
+                    output_dir = sys.argv[output_idx + 1]
+            # Get max_length if specified
+            max_length = 128
+            if '--max_length' in sys.argv:
+                max_len_idx = sys.argv.index('--max_length')
+                if max_len_idx + 1 < len(sys.argv):
+                    max_length = int(sys.argv[max_len_idx + 1])
+            
+            evaluate_bias_model(model_path, output_dir, max_length)
+        else:
+            print("Error: --eval_bias_model requires a model path")
+            print("Usage: python run.py --eval_bias_model <model_path> [--output_dir <dir>] [--max_length <int>]")
         return
     
     # Check for analyze_overlap flag early
@@ -223,6 +376,8 @@ def main():
 
     argp.add_argument('--check_versions', action='store_true',
                       help='Print version information and exit.')
+    argp.add_argument('--eval_bias_model', type=str, default=None,
+                      help='Evaluate hypothesis-only bias model and save predictions.')
     argp.add_argument('--analyze_overlap', type=str, default=None,
                       help='Analyze lexical overlap in predictions file and exit.')
     argp.add_argument('--analysis_output', type=str, default=None,
