@@ -13,11 +13,16 @@ import pandas as pd
 
 NUM_PREPROCESSING_WORKERS = 2
 
+def print_title(title):
+    print("=" * 20)
+    print(title)
+    print("=" * 20)
+
+def print_footer():
+    print("=" * 20)
 
 def check_versions():
-    print("=" * 20)
-    print("ENVIRONMENT INFORMATION")
-    print("=" * 20)
+    print_title("Version and GPU Information")
     print(f"PyTorch version:      {torch.__version__}")
     print(f"Transformers version: {transformers.__version__}")
     print(f"CUDA available:       {torch.cuda.is_available()}")
@@ -26,13 +31,7 @@ def check_versions():
         print(f"GPU device count:     {torch.cuda.device_count()}")
         print(f"Current GPU device:   {torch.cuda.current_device()}")
         print(f"GPU device name:      {torch.cuda.get_device_name(0)}")
-    print("=" * 20)
-
-def print_title(title):
-    print("=" * 20)
-    print(title)
-    print("=" * 20)
-    
+    print_footer()
 
 def analyze_overlap(predictions_file, output_file=None):
     print_title("Lexical Overlap")
