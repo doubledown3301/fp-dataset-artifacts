@@ -1,6 +1,7 @@
 import datasets
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, \
     AutoModelForQuestionAnswering, Trainer, TrainingArguments, HfArgumentParser
+import transformers
 import evaluate
 from helpers import prepare_dataset_nli, prepare_train_dataset_qa, \
     prepare_validation_dataset_qa, QuestionAnsweringTrainer, compute_accuracy
@@ -10,6 +11,25 @@ import torch
 import torch.nn.functional as F
 
 NUM_PREPROCESSING_WORKERS = 2
+
+
+def check_versions():
+    """
+    Print version information for PyTorch and Transformers, and check CUDA availability.
+    """
+    print("=" * 20)
+    print("Pytorch info and Cuda Info")
+    print("=" * 20)
+    print(f"PyTorch version:      {torch.__version__}")
+    print(f"Transformers version: {transformers.__version__}")
+    print(f"CUDA available:       {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA version:         {torch.version.cuda}")
+        print(f"GPU device count:     {torch.cuda.device_count()}")
+        print(f"Current GPU device:   {torch.cuda.current_device()}")
+        print(f"GPU device name:      {torch.cuda.get_device_name(0)}")
+    print("=" * 20)
+
 
 def prepare_dataset_nli_hypothesis_only(examples, tokenizer, max_length):
     """
@@ -66,6 +86,12 @@ class DebiasedTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 def main():
+    # Check for version flag early (before parsing all arguments)
+    import sys
+    if '--check_versions' in sys.argv:
+        check_versions()
+        return
+    
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
     # In particular, TrainingArguments has several keys that you'll need/want to specify (when you call run.py from the command line):
@@ -84,6 +110,8 @@ def main():
     #     Where to put the trained model checkpoint(s) and any eval predictions.
     #     *This argument is required*.
 
+    argp.add_argument('--check_versions', action='store_true',
+                      help='Print version information and exit.')
     argp.add_argument('--model', type=str,
                       default='google/electra-small-discriminator',
                       help="""This argument specifies the base model to fine-tune.
