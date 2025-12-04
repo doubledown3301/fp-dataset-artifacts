@@ -218,11 +218,11 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     )
     tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
     
-    # Load SNLI test set
-    print("Loading SNLI test dataset...")
+    # Load SNLI validation set
+    print("Loading SNLI validation dataset...")
     dataset = datasets.load_dataset("snli")
-    test_dataset = dataset["test"].filter(lambda x: x["label"] != -1)
-    print(f"Test examples: {len(test_dataset)}")
+    eval_dataset = dataset["validation"].filter(lambda x: x["label"] != -1)
+    print(f"Validation examples: {len(eval_dataset)}")
     
     # Tokenize hypothesis only
     def tokenize_hypothesis_only(examples):
@@ -235,8 +235,8 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
         tokenized['label'] = examples['label']
         return tokenized
     
-    print("Tokenizing test dataset...")
-    tokenized_test = test_dataset.map(
+    print("Tokenizing validation dataset...")
+    tokenized_test = eval_dataset.map(
         tokenize_hypothesis_only, 
         batched=True,
         num_proc=NUM_PREPROCESSING_WORKERS,
@@ -314,7 +314,7 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     # Save detailed predictions (optional, for analysis)
     predictions_file = os.path.join(output_dir, 'bias_model_predictions.jsonl')
     with open(predictions_file, 'w') as f:
-        for i, example in enumerate(test_dataset):
+        for i, example in enumerate(eval_dataset):
             pred_data = {
                 'hypothesis': example['hypothesis'],
                 'label': int(example['label']),
@@ -525,11 +525,11 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     biased_model = biased_model.to(device)
     bias_model = bias_model.to(device)
     
-    # Load SNLI test set
-    print("Loading SNLI test dataset...")
+    # Load SNLI validation set (matching what the paper used)
+    print("Loading SNLI validation dataset...")
     dataset = datasets.load_dataset("snli")
-    test_dataset = dataset["test"].filter(lambda x: x["label"] != -1)
-    print(f"Test examples: {len(test_dataset)}")
+    eval_dataset = dataset["validation"].filter(lambda x: x["label"] != -1)
+    print(f"Validation examples: {len(eval_dataset)}")
     
     # Tokenize full premise-hypothesis pairs for biased model
     def tokenize_full(examples):
@@ -550,13 +550,13 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
             max_length=max_length
         )
     
-    print("Tokenizing test dataset...")
-    tokenized_full = test_dataset.map(
+    print("Tokenizing validation dataset...")
+    tokenized_full = eval_dataset.map(
         tokenize_full,
         batched=True,
         num_proc=NUM_PREPROCESSING_WORKERS
     )
-    tokenized_hypo = test_dataset.map(
+    tokenized_hypo = eval_dataset.map(
         tokenize_hypothesis_only,
         batched=True,
         num_proc=NUM_PREPROCESSING_WORKERS
@@ -599,7 +599,7 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     debiased_preds = np.argmax(debiased_logits, axis=1)
     
     # Get true labels
-    true_labels = np.array(test_dataset['label'])
+    true_labels = np.array(eval_dataset['label'])
     
     # Calculate accuracies
     biased_acc = accuracy_score(true_labels, biased_preds)
@@ -663,7 +663,7 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     # Save detailed predictions
     predictions_file = os.path.join(output_dir, 'debiased_predictions.jsonl')
     with open(predictions_file, 'w') as f:
-        for i, example in enumerate(test_dataset):
+        for i, example in enumerate(eval_dataset):
             pred_data = {
                 'premise': example['premise'],
                 'hypothesis': example['hypothesis'],
