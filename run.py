@@ -9,17 +9,16 @@ import os
 import json
 import torch
 import torch.nn.functional as F
+import pandas as pd
 
 NUM_PREPROCESSING_WORKERS = 2
 
 
 def check_versions():
-    """
-    Print version information for PyTorch and Transformers, and check CUDA availability.
-    """
-    print("=" * 60)
+
+    print("=" * 20)
     print("ENVIRONMENT INFORMATION")
-    print("=" * 60)
+    print("=" * 20)
     print(f"PyTorch version:      {torch.__version__}")
     print(f"Transformers version: {transformers.__version__}")
     print(f"CUDA available:       {torch.cuda.is_available()}")
@@ -28,19 +27,13 @@ def check_versions():
         print(f"GPU device count:     {torch.cuda.device_count()}")
         print(f"Current GPU device:   {torch.cuda.current_device()}")
         print(f"GPU device name:      {torch.cuda.get_device_name(0)}")
-    print("=" * 60)
+    print("=" * 20)
 
 
 def analyze_overlap(predictions_file, output_file=None):
-    """
-    Analyze lexical overlap artifact in predictions.
-    Computes word overlap and accuracy by overlap quartiles.
-    """
-    import pandas as pd
-    
-    print("=" * 60)
+    print("=" * 20)
     print("LEXICAL OVERLAP ANALYSIS")
-    print("=" * 60)
+    print("=" * 20)
     
     # Load predictions
     predictions = []
