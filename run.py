@@ -192,10 +192,21 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     """
     print_title("Evaluating Hypothesis-Only Bias Model")
     
+    # Convert to absolute path if it's a relative path
+    if not os.path.isabs(model_path):
+        model_path = os.path.abspath(model_path)
+    
+    # Verify the path exists
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+    
     # Load model and tokenizer
     print(f"Loading model from: {model_path}")
-    # Ensure we're loading from local path by using local_files_only=True
-    model = AutoModelForSequenceClassification.from_pretrained(model_path, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_path, 
+        local_files_only=True,
+        trust_remote_code=False
+    )
     tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
     
     # Load SNLI test set
@@ -309,11 +320,236 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     
     return results
 
+def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alpha=1.0, max_length=128):
+    """
+    Perform ensemble debiasing by combining biased and bias-only model predictions.
+    
+    Args:
+        biased_model_path: Path to the full (biased) model
+        bias_model_path: Path to the hypothesis-only bias model
+        output_dir: Directory to save debiased results
+        alpha: Weight for bias model logits (default=1.0)
+        max_length: Maximum sequence length
+    """
+    print_title("Ensemble Debiasing Evaluation")
+    
+    # Load models
+    print(f"Loading biased model from: {biased_model_path}")
+    biased_model = AutoModelForSequenceClassification.from_pretrained(
+        biased_model_path, local_files_only=True
+    )
+    biased_model.eval()
+    
+    print(f"Loading bias model from: {bias_model_path}")
+    bias_model = AutoModelForSequenceClassification.from_pretrained(
+        bias_model_path, local_files_only=True
+    )
+    bias_model.eval()
+    
+    tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
+    
+    # Move models to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    biased_model = biased_model.to(device)
+    bias_model = bias_model.to(device)
+    
+    # Load SNLI test set
+    print("Loading SNLI test dataset...")
+    dataset = datasets.load_dataset("snli")
+    test_dataset = dataset["test"].filter(lambda x: x["label"] != -1)
+    print(f"Test examples: {len(test_dataset)}")
+    
+    # Tokenize full premise-hypothesis pairs for biased model
+    def tokenize_full(examples):
+        return tokenizer(
+            examples["premise"],
+            examples["hypothesis"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )
+    
+    # Tokenize hypothesis only for bias model
+    def tokenize_hypothesis_only(examples):
+        return tokenizer(
+            examples["hypothesis"],
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )
+    
+    print("Tokenizing test dataset...")
+    tokenized_full = test_dataset.map(
+        tokenize_full,
+        batched=True,
+        num_proc=NUM_PREPROCESSING_WORKERS
+    )
+    tokenized_hypo = test_dataset.map(
+        tokenize_hypothesis_only,
+        batched=True,
+        num_proc=NUM_PREPROCESSING_WORKERS
+    )
+    
+    # Get predictions from both models
+    print("Getting predictions from biased model...")
+    biased_logits = []
+    with torch.no_grad():
+        for i in range(0, len(tokenized_full), 32):  # batch size 32
+            batch = tokenized_full[i:i+32]
+            inputs = {
+                'input_ids': torch.tensor(batch['input_ids']).to(device),
+                'attention_mask': torch.tensor(batch['attention_mask']).to(device)
+            }
+            outputs = biased_model(**inputs)
+            biased_logits.append(outputs.logits.cpu().numpy())
+    biased_logits = np.vstack(biased_logits)
+    
+    print("Getting predictions from bias model...")
+    bias_logits = []
+    with torch.no_grad():
+        for i in range(0, len(tokenized_hypo), 32):
+            batch = tokenized_hypo[i:i+32]
+            inputs = {
+                'input_ids': torch.tensor(batch['input_ids']).to(device),
+                'attention_mask': torch.tensor(batch['attention_mask']).to(device)
+            }
+            outputs = bias_model(**inputs)
+            bias_logits.append(outputs.logits.cpu().numpy())
+    bias_logits = np.vstack(bias_logits)
+    
+    # Ensemble debiasing: subtract weighted bias logits from biased logits
+    print(f"Applying ensemble debiasing (alpha={alpha})...")
+    debiased_logits = biased_logits - alpha * bias_logits
+    
+    # Get predictions
+    biased_preds = np.argmax(biased_logits, axis=1)
+    bias_preds = np.argmax(bias_logits, axis=1)
+    debiased_preds = np.argmax(debiased_logits, axis=1)
+    
+    # Get true labels
+    true_labels = np.array(test_dataset['label'])
+    
+    # Calculate accuracies
+    biased_acc = accuracy_score(true_labels, biased_preds)
+    bias_acc = accuracy_score(true_labels, bias_preds)
+    debiased_acc = accuracy_score(true_labels, debiased_preds)
+    
+    # Calculate metrics for debiased model
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        true_labels, debiased_preds, average='weighted'
+    )
+    
+    # Print results
+    print("\n" + "=" * 60)
+    print("ENSEMBLE DEBIASING RESULTS")
+    print("=" * 60)
+    print(f"Bias-only model accuracy:     {bias_acc:.4f}")
+    print(f"Biased model accuracy:        {biased_acc:.4f}")
+    print(f"Debiased model accuracy:      {debiased_acc:.4f}")
+    print(f"\nDebiased model metrics:")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1:        {f1:.4f}")
+    print("=" * 60)
+    
+    # Per-class performance for debiased model
+    print("\n" + "=" * 60)
+    print("DEBIASED MODEL - PER-CLASS PERFORMANCE")
+    print("=" * 60)
+    print(classification_report(
+        true_labels,
+        debiased_preds,
+        target_names=['Entailment', 'Neutral', 'Contradiction'],
+        digits=4
+    ))
+    print("=" * 60)
+    
+    # Save results
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save comparison metrics
+    comparison_file = os.path.join(output_dir, 'debiasing_comparison.json')
+    comparison_results = {
+        'alpha': alpha,
+        'bias_only_accuracy': float(bias_acc),
+        'biased_accuracy': float(biased_acc),
+        'debiased_accuracy': float(debiased_acc),
+        'debiased_precision': float(precision),
+        'debiased_recall': float(recall),
+        'debiased_f1': float(f1),
+        'accuracy_drop': float(biased_acc - debiased_acc)
+    }
+    with open(comparison_file, 'w') as f:
+        json.dump(comparison_results, f, indent=2)
+    print(f"\n✓ Comparison metrics saved to: {comparison_file}")
+    
+    # Save debiased logits
+    logits_file = os.path.join(output_dir, 'debiased_logits.npy')
+    np.save(logits_file, debiased_logits)
+    print(f"✓ Debiased logits saved to: {logits_file}")
+    
+    # Save detailed predictions
+    predictions_file = os.path.join(output_dir, 'debiased_predictions.jsonl')
+    with open(predictions_file, 'w') as f:
+        for i, example in enumerate(test_dataset):
+            pred_data = {
+                'premise': example['premise'],
+                'hypothesis': example['hypothesis'],
+                'label': int(example['label']),
+                'biased_prediction': int(biased_preds[i]),
+                'bias_prediction': int(bias_preds[i]),
+                'debiased_prediction': int(debiased_preds[i]),
+                'biased_correct': int(biased_preds[i]) == int(example['label']),
+                'debiased_correct': int(debiased_preds[i]) == int(example['label'])
+            }
+            f.write(json.dumps(pred_data) + '\n')
+    print(f"✓ Detailed predictions saved to: {predictions_file}")
+    
+    print_footer()
+    
+    return comparison_results
+
 def main():
     # Check for version flag early (before parsing all arguments)
     import sys
     if '--check_versions' in sys.argv:
         check_versions()
+        return
+    
+    # Check for ensemble debiasing flag early
+    if '--ensemble_debias' in sys.argv:
+        # Get required parameters
+        if '--biased_model' not in sys.argv or '--bias_model' not in sys.argv:
+            print("Error: --ensemble_debias requires --biased_model and --bias_model")
+            print("Usage: python run.py --ensemble_debias --biased_model <path> --bias_model <path> [--output_dir <dir>] [--alpha <float>]")
+            return
+        
+        biased_idx = sys.argv.index('--biased_model')
+        bias_idx = sys.argv.index('--bias_model')
+        
+        biased_model_path = sys.argv[biased_idx + 1]
+        bias_model_path = sys.argv[bias_idx + 1]
+        
+        # Get optional parameters
+        output_dir = './debiased_model_eval'
+        if '--output_dir' in sys.argv:
+            output_idx = sys.argv.index('--output_dir')
+            if output_idx + 1 < len(sys.argv):
+                output_dir = sys.argv[output_idx + 1]
+        
+        alpha = 1.0
+        if '--alpha' in sys.argv:
+            alpha_idx = sys.argv.index('--alpha')
+            if alpha_idx + 1 < len(sys.argv):
+                alpha = float(sys.argv[alpha_idx + 1])
+        
+        max_length = 128
+        if '--max_length' in sys.argv:
+            max_len_idx = sys.argv.index('--max_length')
+            if max_len_idx + 1 < len(sys.argv):
+                max_length = int(sys.argv[max_len_idx + 1])
+        
+        ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alpha, max_length)
         return
     
     # Check for evaluate bias model flag early
@@ -377,6 +613,14 @@ def main():
 
     argp.add_argument('--check_versions', action='store_true',
                       help='Print version information and exit.')
+    argp.add_argument('--ensemble_debias', action='store_true',
+                      help='Perform ensemble debiasing using biased and bias models.')
+    argp.add_argument('--biased_model', type=str, default=None,
+                      help='Path to biased (full) model for ensemble debiasing.')
+    argp.add_argument('--bias_model', type=str, default=None,
+                      help='Path to bias (hypothesis-only) model for ensemble debiasing.')
+    argp.add_argument('--alpha', type=float, default=1.0,
+                      help='Weight for bias model logits in ensemble debiasing (default=1.0).')
     argp.add_argument('--eval_bias_model', type=str, default=None,
                       help='Evaluate hypothesis-only bias model and save predictions.')
     argp.add_argument('--analyze_overlap', type=str, default=None,
