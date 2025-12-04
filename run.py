@@ -15,7 +15,6 @@ NUM_PREPROCESSING_WORKERS = 2
 
 
 def check_versions():
-
     print("=" * 20)
     print("ENVIRONMENT INFORMATION")
     print("=" * 20)
@@ -29,11 +28,14 @@ def check_versions():
         print(f"GPU device name:      {torch.cuda.get_device_name(0)}")
     print("=" * 20)
 
+def print_title(title):
+    print("=" * 20)
+    print(title)
+    print("=" * 20)
+    
 
 def analyze_overlap(predictions_file, output_file=None):
-    print("=" * 20)
-    print("LEXICAL OVERLAP ANALYSIS")
-    print("=" * 20)
+    print_title("Lexical Overlap")
     
     # Load predictions
     predictions = []
@@ -105,7 +107,7 @@ def analyze_overlap(predictions_file, output_file=None):
     else:
         print(f"  ✓ Minimal overlap artifact")
     
-    print("=" * 60)
+    print("=" * 20)
     
     # Save results if output file specified
     if output_file:
@@ -129,10 +131,6 @@ def analyze_overlap(predictions_file, output_file=None):
 
 
 def prepare_dataset_nli_hypothesis_only(examples, tokenizer, max_length):
-    """
-    Preprocessing function for hypothesis-only training (bias model).
-    Only tokenizes the hypothesis, not the premise.
-    """
     tokenized = tokenizer(
         examples['hypothesis'],
         max_length=max_length,
