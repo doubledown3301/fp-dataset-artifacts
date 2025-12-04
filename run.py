@@ -329,6 +329,169 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     
     return results
 
+def analyze_hypothesis_bias(predictions_file, output_file=None):
+    """
+    Analyze hypothesis-only biases including negation words and length patterns.
+    
+    Args:
+        predictions_file: Path to predictions jsonl file
+        output_file: Optional path to save analysis results
+    """
+    print_title("Hypothesis Bias Analysis")
+    
+    # Load predictions
+    predictions = []
+    with open(predictions_file, 'r') as f:
+        for line in f:
+            predictions.append(json.loads(line))
+    
+    print(f"Loaded {len(predictions)} predictions\n")
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(predictions)
+    df['correct'] = df['label'] == df['predicted_label']
+    
+    overall_acc = df['correct'].mean()
+    print(f"Overall Accuracy: {overall_acc:.4f}\n")
+    
+    # Analyze word patterns
+    def analyze_word_pattern(df, word, word_label):
+        hypothesis_with_word = df['hypothesis'].str.lower().str.contains(word, na=False, regex=False)
+        
+        print(f"=== Hypothesis contains '{word}' ===")
+        total_with_word = hypothesis_with_word.sum()
+        total_without_word = (~hypothesis_with_word).sum()
+        print(f"With '{word}': {total_with_word} ({total_with_word/len(df)*100:.1f}%)")
+        print(f"Without '{word}': {total_without_word} ({total_without_word/len(df)*100:.1f}%)")
+        
+        # Distribution of labels when word is present
+        subset_with = df[hypothesis_with_word]
+        subset_without = df[~hypothesis_with_word]
+        
+        label_names = ['Entailment', 'Neutral', 'Contradiction']
+        
+        results = {
+            'word': word,
+            'total_with_word': int(total_with_word),
+            'total_without_word': int(total_without_word),
+            'with_word': {},
+            'without_word': {}
+        }
+        
+        print(f"\nWith '{word}':")
+        for label in [0, 1, 2]:
+            count = (subset_with['label'] == label).sum()
+            pct = count / len(subset_with) * 100 if len(subset_with) > 0 else 0
+            acc = subset_with[subset_with['label'] == label]['correct'].mean() if count > 0 else 0
+            print(f"  {label_names[label]:13s}: {count:4d} ({pct:5.1f}%) - Accuracy: {acc:.4f}")
+            results['with_word'][label_names[label].lower()] = {
+                'count': int(count),
+                'percentage': float(pct),
+                'accuracy': float(acc) if count > 0 else None
+            }
+        
+        print(f"\nWithout '{word}':")
+        for label in [0, 1, 2]:
+            count = (subset_without['label'] == label).sum()
+            pct = count / len(subset_without) * 100 if len(subset_without) > 0 else 0
+            acc = subset_without[subset_without['label'] == label]['correct'].mean() if count > 0 else 0
+            print(f"  {label_names[label]:13s}: {count:4d} ({pct:5.1f}%) - Accuracy: {acc:.4f}")
+            results['without_word'][label_names[label].lower()] = {
+                'count': int(count),
+                'percentage': float(pct),
+                'accuracy': float(acc) if count > 0 else None
+            }
+        
+        print()
+        return results
+    
+    # Analyze negation words
+    print("=" * 60)
+    print("NEGATION WORD ANALYSIS")
+    print("=" * 60)
+    
+    negation_results = []
+    for word in ['not', 'no ', 'never', "n't"]:
+        result = analyze_word_pattern(df, word, 'negation')
+        negation_results.append(result)
+    
+    # Analyze hypothesis length
+    print("=" * 60)
+    print("HYPOTHESIS LENGTH ANALYSIS")
+    print("=" * 60)
+    
+    df['hyp_length'] = df['hypothesis'].str.split().str.len()
+    
+    print("\nAverage hypothesis length by label:")
+    label_names = ['Entailment', 'Neutral', 'Contradiction']
+    length_by_label = {}
+    for label in [0, 1, 2]:
+        avg_len = df[df['label'] == label]['hyp_length'].mean()
+        print(f"  {label_names[label]:13s}: {avg_len:.2f} words")
+        length_by_label[label_names[label].lower()] = float(avg_len)
+    
+    # Accuracy by length quartile
+    print("\nAccuracy by hypothesis length quartile:")
+    df['length_quartile'] = pd.qcut(df['hyp_length'], q=4, labels=['Q1 (Short)', 'Q2', 'Q3', 'Q4 (Long)'], duplicates='drop')
+    
+    length_quartile_results = []
+    for quartile in df['length_quartile'].unique():
+        subset = df[df['length_quartile'] == quartile]
+        acc = subset['correct'].mean()
+        min_len = subset['hyp_length'].min()
+        max_len = subset['hyp_length'].max()
+        avg_len = subset['hyp_length'].mean()
+        count = len(subset)
+        print(f"  {str(quartile):12s}: {acc:.4f} ({min_len}-{max_len} words, avg={avg_len:.1f}, n={count})")
+        length_quartile_results.append({
+            'quartile': str(quartile),
+            'accuracy': float(acc),
+            'min_length': int(min_len),
+            'max_length': int(max_len),
+            'avg_length': float(avg_len),
+            'count': int(count)
+        })
+    
+    # Check for length bias
+    short_acc = df[df['length_quartile'] == 'Q1 (Short)']['correct'].mean() if 'Q1 (Short)' in df['length_quartile'].values else None
+    long_acc = df[df['length_quartile'] == 'Q4 (Long)']['correct'].mean() if 'Q4 (Long)' in df['length_quartile'].values else None
+    
+    if short_acc is not None and long_acc is not None:
+        length_gap = long_acc - short_acc
+        print(f"\nLength Bias Analysis:")
+        print(f"  Short (Q1) accuracy: {short_acc:.4f}")
+        print(f"  Long (Q4) accuracy:  {long_acc:.4f}")
+        print(f"  Accuracy gap:        {length_gap:+.4f} ({length_gap*100:+.2f} percentage points)")
+        
+        if abs(length_gap) > 0.02:
+            print(f"  ⚠️  Significant length bias detected!")
+        else:
+            print(f"  ✓ Minimal length bias")
+    
+    print("=" * 60)
+    
+    # Save results if output file specified
+    if output_file:
+        results = {
+            'overall_accuracy': float(overall_acc),
+            'negation_analysis': negation_results,
+            'length_analysis': {
+                'avg_length_by_label': length_by_label,
+                'accuracy_by_quartile': length_quartile_results,
+                'length_gap': float(length_gap) if short_acc is not None and long_acc is not None else None,
+                'length_bias_detected': bool(abs(length_gap) > 0.02) if short_acc is not None and long_acc is not None else None
+            }
+        }
+        
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"\nResults saved to: {output_file}")
+    
+    print_footer()
+    
+    return df
+
 def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alpha=1.0, max_length=128):
     """
     Perform ensemble debiasing by combining biased and bias-only model predictions.
@@ -602,6 +765,23 @@ def main():
             print("Usage: python run.py --analyze_overlap <predictions.jsonl> [--analysis_output <output.json>]")
         return
     
+    # Check for analyze_hypothesis_bias flag early
+    if '--analyze_hypothesis_bias' in sys.argv:
+        idx = sys.argv.index('--analyze_hypothesis_bias')
+        if idx + 1 < len(sys.argv):
+            predictions_file = sys.argv[idx + 1]
+            # Check for optional output file
+            output_file = None
+            if '--analysis_output' in sys.argv:
+                output_idx = sys.argv.index('--analysis_output')
+                if output_idx + 1 < len(sys.argv):
+                    output_file = sys.argv[output_idx + 1]
+            analyze_hypothesis_bias(predictions_file, output_file)
+        else:
+            print("Error: --analyze_hypothesis_bias requires a predictions file path")
+            print("Usage: python run.py --analyze_hypothesis_bias <predictions.jsonl> [--analysis_output <output.json>]")
+        return
+    
     argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
     # In particular, TrainingArguments has several keys that you'll need/want to specify (when you call run.py from the command line):
@@ -634,6 +814,8 @@ def main():
                       help='Evaluate hypothesis-only bias model and save predictions.')
     argp.add_argument('--analyze_overlap', type=str, default=None,
                       help='Analyze lexical overlap in predictions file and exit.')
+    argp.add_argument('--analyze_hypothesis_bias', type=str, default=None,
+                      help='Analyze hypothesis-only biases (negation, length) in predictions file and exit.')
     argp.add_argument('--analysis_output', type=str, default=None,
                       help='Optional: Save analysis results to JSON file.')
     argp.add_argument('--model', type=str,
