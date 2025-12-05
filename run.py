@@ -1,3 +1,8 @@
+"""
+CS388 NLP Final Project: Dataset Artifact Analysis
+Author: Darin Beaudreau
+"""
+
 import datasets
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, \
     AutoModelForQuestionAnswering, Trainer, TrainingArguments, HfArgumentParser
@@ -15,6 +20,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, cla
 
 NUM_PREPROCESSING_WORKERS = 2
 
+# Helper functions for printing titles and footers
 def print_title(title):
     print("=" * 20)
     print(title)
@@ -24,7 +30,6 @@ def print_footer():
     print("=" * 20)
 
 def calculate_word_overlap(premise, hypothesis):
-    """Calculate word overlap between premise and hypothesis."""
     p_words = set(premise.lower().split())
     h_words = set(hypothesis.lower().split())
     if len(h_words) == 0:
@@ -32,18 +37,6 @@ def calculate_word_overlap(premise, hypothesis):
     return len(p_words & h_words) / len(h_words)
 
 def filter_by_overlap(dataset, threshold=0.35, keep_below=True):
-    """
-    Filter dataset by lexical overlap.
-    
-    Args:
-        dataset: HuggingFace dataset
-        threshold: Overlap threshold (default 0.35)
-        keep_below: If True, keep examples with overlap < threshold
-                   If False, keep examples with overlap >= threshold
-    
-    Returns:
-        Filtered dataset
-    """
     print(f"Filtering dataset by overlap {'<' if keep_below else '>='} {threshold}")
     print(f"Original dataset size: {len(dataset)}")
     
@@ -58,6 +51,7 @@ def filter_by_overlap(dataset, threshold=0.35, keep_below=True):
     print(f"Filtered dataset size: {len(filtered)} ({len(filtered)/len(dataset)*100:.1f}% retained)")
     return filtered
 
+#helper function to check versions and GPU availability
 def check_versions():
     print_title("Version and GPU Information")
     print(f"PyTorch version:      {torch.__version__}")
@@ -70,10 +64,15 @@ def check_versions():
         print(f"GPU device name:      {torch.cuda.get_device_name(0)}")
     print_footer()
 
+
+###
+#  Lexical Overlap Analysis
+#  Given a predictions file (JSONL), analyze accuracy by overlap quartiles
+#  Also detect potential overlap artifacts
+###
 def analyze_overlap(predictions_file, output_file=None):
     print_title("Lexical Overlap")
     
-    # Load predictions
     predictions = []
     with open(predictions_file, 'r') as f:
         for line in f:
@@ -81,7 +80,6 @@ def analyze_overlap(predictions_file, output_file=None):
     
     print(f"Loaded {len(predictions)} predictions\n")
     
-    # Calculate word overlap
     def word_overlap(premise, hypothesis):
         p_words = set(premise.lower().split())
         h_words = set(hypothesis.lower().split())
@@ -95,11 +93,9 @@ def analyze_overlap(predictions_file, output_file=None):
     
     df = pd.DataFrame(predictions)
     
-    # Overall accuracy
     overall_acc = df['correct'].mean()
     print(f"Overall Accuracy: {overall_acc:.4f} ({df['correct'].sum()}/{len(df)})\n")
     
-    # Accuracy by label
     print("Accuracy by Label:")
     label_names = ['Entailment', 'Neutral', 'Contradiction']
     for label in [0, 1, 2]:
@@ -108,7 +104,6 @@ def analyze_overlap(predictions_file, output_file=None):
         avg_overlap = subset['overlap'].mean()
         print(f"  {label_names[label]:13s}: {acc:.4f} (avg overlap: {avg_overlap:.3f})")
     
-    # Accuracy by overlap quartiles
     print("\nAccuracy by Overlap Quartile:")
     df['overlap_quartile'] = pd.qcut(df['overlap'], q=4, labels=['Q1 (Low)', 'Q2', 'Q3', 'Q4 (High)'], duplicates='drop')
     
@@ -128,7 +123,6 @@ def analyze_overlap(predictions_file, output_file=None):
             'count': count
         })
     
-    # Check for artifact (accuracy gap between high/low overlap)
     low_overlap_acc = df[df['overlap_quartile'] == 'Q1 (Low)']['correct'].mean()
     high_overlap_acc = df[df['overlap_quartile'] == 'Q4 (High)']['correct'].mean()
     gap = high_overlap_acc - low_overlap_acc
@@ -138,14 +132,15 @@ def analyze_overlap(predictions_file, output_file=None):
     print(f"  Low overlap (Q1) accuracy:  {low_overlap_acc:.4f}")
     print(f"  Accuracy gap:                {gap:+.4f} ({gap*100:+.2f} percentage points)")
     
+    # Using 2% threshold for detecting significant artifacts (common heuristic in NLP bias detection)
+    # it was used in several papers regarding overlap artifacts in NLI datasets
     if abs(gap) > 0.02:
-        print(f"  ⚠️  Significant overlap artifact detected!")
+        print(f"Significant overlap artifact detected!")
     else:
-        print(f"  ✓ Minimal overlap artifact")
+        print(f"Minimal overlap artifact")
     
-    print("=" * 20)
+    print_footer()
     
-    # Save results if output file specified
     if output_file:
         results = {
             'overall_accuracy': float(overall_acc),
@@ -185,66 +180,57 @@ def prepare_dataset_nli_hypothesis_only(examples, tokenizer, max_length):
     tokenized['label'] = examples['label']
     return tokenized
 
+# Custom Trainer that incorporates bias model for debiasing
 class DebiasedTrainer(Trainer):
     
     def __init__(self, *args, bias_model=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.bias_model = bias_model
-        self.bias_model_moved = False  # Track if we've moved bias model to GPU
+        self.bias_model_moved = False  
         
+    # Override compute_loss to include bias model
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
         
         if self.bias_model is not None:
-            # Move bias model to same device as inputs (only do this once)
             if not self.bias_model_moved:
                 device = next(model.parameters()).device
                 self.bias_model = self.bias_model.to(device)
                 self.bias_model_moved = True
             
-            # Get bias model predictions
             with torch.no_grad():
                 bias_outputs = self.bias_model(**inputs)
                 bias_probs = F.softmax(bias_outputs.logits, dim=-1)
                 bias_confidence = bias_probs.max(dim=-1)[0]
             
             # Reweight loss: downweight examples where bias model is confident
-            # Weight = 1 / (1 + bias_confidence)
             weights = 1.0 / (1.0 + bias_confidence)
             
-            # Compute weighted cross-entropy loss
             loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
             loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
             loss = (loss * weights).mean()
         else:
-            # Standard loss
             loss_fct = torch.nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
         
         return (loss, outputs) if return_outputs else loss
 
+###
+# Evaluate Hypothesis-Only Bias Model
+# Given a trained bias model path, evaluate on SNLI validation set
+# Save predictions and metrics to output directory
+###
 def evaluate_bias_model(model_path, output_dir, max_length=128):
-    """
-    Evaluate hypothesis-only bias model on SNLI test set.
-    
-    Args:
-        model_path: Path to trained hypothesis-only model
-        output_dir: Directory to save evaluation results and predictions
-        max_length: Maximum sequence length for tokenization
-    """
     print_title("Evaluating Hypothesis-Only Bias Model")
     
-    # Convert to absolute path if it's a relative path
     if not os.path.isabs(model_path):
         model_path = os.path.abspath(model_path)
     
-    # Verify the path exists
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model path does not exist: {model_path}")
     
-    # Load model and tokenizer
     print(f"Loading model from: {model_path}")
     model = AutoModelForSequenceClassification.from_pretrained(
         model_path, 
@@ -253,13 +239,11 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
     )
     tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
     
-    # Load SNLI validation set
     print("Loading SNLI validation dataset...")
     dataset = datasets.load_dataset("snli")
     eval_dataset = dataset["validation"].filter(lambda x: x["label"] != -1)
     print(f"Validation examples: {len(eval_dataset)}")
     
-    # Tokenize hypothesis only
     def tokenize_hypothesis_only(examples):
         tokenized = tokenizer(
             examples["hypothesis"],
@@ -271,14 +255,13 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
         return tokenized
     
     print("Tokenizing validation dataset...")
-    tokenized_test = eval_dataset.map(
+    tokenized_eval = eval_dataset.map(
         tokenize_hypothesis_only, 
         batched=True,
         num_proc=NUM_PREPROCESSING_WORKERS,
-        remove_columns=test_dataset.column_names
+        remove_columns=eval_dataset.column_names
     )
     
-    # Define compute_metrics function
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
         predictions = np.argmax(predictions, axis=1)
@@ -295,7 +278,6 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
             'f1': f1
         }
     
-    # Create Trainer for evaluation
     print("Running evaluation...")
     trainer = Trainer(
         model=model,
@@ -303,50 +285,39 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
         compute_metrics=compute_metrics
     )
     
-    # Evaluate on test set
-    results = trainer.evaluate(tokenized_test)
+    results = trainer.evaluate(tokenized_eval)
     
-    print("\n" + "=" * 50)
-    print("HYPOTHESIS-ONLY BIAS MODEL RESULTS")
-    print("=" * 50)
+    print_title("Hypothesis-Only Model Evaluation Results")
     print(f"Test Accuracy:  {results['eval_accuracy']:.4f}")
     print(f"Test F1:        {results['eval_f1']:.4f}")
     print(f"Test Precision: {results['eval_precision']:.4f}")
     print(f"Test Recall:    {results['eval_recall']:.4f}")
-    print("=" * 50)
+    print_footer()
     
-    # Get predictions for ensemble use
-    predictions = trainer.predict(tokenized_test)
+    predictions = trainer.predict(tokenized_eval)
     pred_labels = np.argmax(predictions.predictions, axis=1)
     true_labels = predictions.label_ids
     
-    # Per-class performance
-    print("\n" + "=" * 50)
-    print("PER-CLASS PERFORMANCE")
-    print("=" * 50)
+    print_title("Per-Class Performance")
     print(classification_report(
         true_labels, 
         pred_labels, 
         target_names=['Entailment', 'Neutral', 'Contradiction'],
         digits=4
     ))
-    print("=" * 50)
+    print_footer()
     
-    # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save evaluation metrics
     metrics_file = os.path.join(output_dir, 'bias_model_eval_metrics.json')
     with open(metrics_file, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"\n✓ Metrics saved to: {metrics_file}")
+    print(f"\nMetrics saved to: {metrics_file}")
     
-    # Save prediction logits (for ensemble debiasing)
     logits_file = os.path.join(output_dir, 'bias_model_predictions.npy')
     np.save(logits_file, predictions.predictions)
-    print(f"✓ Prediction logits saved to: {logits_file}")
+    print(f"Prediction logits saved to: {logits_file}")
     
-    # Save detailed predictions (optional, for analysis)
     predictions_file = os.path.join(output_dir, 'bias_model_predictions.jsonl')
     with open(predictions_file, 'w') as f:
         for i, example in enumerate(eval_dataset):
@@ -358,23 +329,20 @@ def evaluate_bias_model(model_path, output_dir, max_length=128):
                 'correct': int(pred_labels[i]) == int(example['label'])
             }
             f.write(json.dumps(pred_data) + '\n')
-    print(f"✓ Detailed predictions saved to: {predictions_file}")
+    print(f"Detailed predictions saved to: {predictions_file}")
     
     print_footer()
     
     return results
 
+###
+#  Hypothesis-Only Bias Analysis
+#  Given a predictions file (JSONL), analyze accuracy by presence of negation words
+#  Also analyze accuracy by hypothesis length
+###
 def analyze_hypothesis_bias(predictions_file, output_file=None):
-    """
-    Analyze hypothesis-only biases including negation words and length patterns.
-    
-    Args:
-        predictions_file: Path to predictions jsonl file
-        output_file: Optional path to save analysis results
-    """
     print_title("Hypothesis Bias Analysis")
     
-    # Load predictions
     predictions = []
     with open(predictions_file, 'r') as f:
         for line in f:
@@ -382,14 +350,12 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
     
     print(f"Loaded {len(predictions)} predictions\n")
     
-    # Convert to DataFrame
     df = pd.DataFrame(predictions)
     df['correct'] = df['label'] == df['predicted_label']
     
     overall_acc = df['correct'].mean()
     print(f"Overall Accuracy: {overall_acc:.4f}\n")
     
-    # Analyze word patterns
     def analyze_word_pattern(df, word, word_label):
         hypothesis_with_word = df['hypothesis'].str.lower().str.contains(word, na=False, regex=False)
         
@@ -399,7 +365,6 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
         print(f"With '{word}': {total_with_word} ({total_with_word/len(df)*100:.1f}%)")
         print(f"Without '{word}': {total_without_word} ({total_without_word/len(df)*100:.1f}%)")
         
-        # Distribution of labels when word is present
         subset_with = df[hypothesis_with_word]
         subset_without = df[~hypothesis_with_word]
         
@@ -440,20 +405,14 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
         print()
         return results
     
-    # Analyze negation words
-    print("=" * 60)
-    print("NEGATION WORD ANALYSIS")
-    print("=" * 60)
+    print_title("Negation Word Analysis")
     
     negation_results = []
     for word in ['not', 'no ', 'never', "n't"]:
         result = analyze_word_pattern(df, word, 'negation')
         negation_results.append(result)
     
-    # Analyze hypothesis length
-    print("=" * 60)
-    print("HYPOTHESIS LENGTH ANALYSIS")
-    print("=" * 60)
+    print_title("Hypothesis Length Analysis")
     
     df['hyp_length'] = df['hypothesis'].str.split().str.len()
     
@@ -465,7 +424,6 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
         print(f"  {label_names[label]:13s}: {avg_len:.2f} words")
         length_by_label[label_names[label].lower()] = float(avg_len)
     
-    # Accuracy by length quartile
     print("\nAccuracy by hypothesis length quartile:")
     df['length_quartile'] = pd.qcut(df['hyp_length'], q=4, labels=['Q1 (Short)', 'Q2', 'Q3', 'Q4 (Long)'], duplicates='drop')
     
@@ -487,7 +445,6 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
             'count': int(count)
         })
     
-    # Check for length bias
     short_acc = df[df['length_quartile'] == 'Q1 (Short)']['correct'].mean() if 'Q1 (Short)' in df['length_quartile'].values else None
     long_acc = df[df['length_quartile'] == 'Q4 (Long)']['correct'].mean() if 'Q4 (Long)' in df['length_quartile'].values else None
     
@@ -499,13 +456,12 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
         print(f"  Accuracy gap:        {length_gap:+.4f} ({length_gap*100:+.2f} percentage points)")
         
         if abs(length_gap) > 0.02:
-            print(f"  ⚠️  Significant length bias detected!")
+            print(f"Significant length bias detected!")
         else:
-            print(f"  ✓ Minimal length bias")
+            print(f"Minimal length bias")
     
-    print("=" * 60)
+    print_footer()
     
-    # Save results if output file specified
     if output_file:
         results = {
             'overall_accuracy': float(overall_acc),
@@ -527,20 +483,16 @@ def analyze_hypothesis_bias(predictions_file, output_file=None):
     
     return df
 
+###
+#  Ensemble Debiasing Evaluation
+#  Given paths to biased model and bias model, evaluate ensemble debiasing on SNLI validation set
+#  Save predictions and metrics to output directory
+###
 def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alpha=1.0, max_length=128):
-    """
-    Perform ensemble debiasing by combining biased and bias-only model predictions.
-    
-    Args:
-        biased_model_path: Path to the full (biased) model
-        bias_model_path: Path to the hypothesis-only bias model
-        output_dir: Directory to save debiased results
-        alpha: Weight for bias model logits (default=1.0)
-        max_length: Maximum sequence length
-    """
+    #using batch size of 32 for evaluation, this size was recommended by google colab to avoid memory issues while training
+    batch_size = 32
     print_title("Ensemble Debiasing Evaluation")
     
-    # Load models
     print(f"Loading biased model from: {biased_model_path}")
     biased_model = AutoModelForSequenceClassification.from_pretrained(
         biased_model_path, local_files_only=True
@@ -555,18 +507,15 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     
     tokenizer = AutoTokenizer.from_pretrained("google/electra-small-discriminator")
     
-    # Move models to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     biased_model = biased_model.to(device)
     bias_model = bias_model.to(device)
     
-    # Load SNLI validation set (matching what the paper used)
     print("Loading SNLI validation dataset...")
     dataset = datasets.load_dataset("snli")
     eval_dataset = dataset["validation"].filter(lambda x: x["label"] != -1)
     print(f"Validation examples: {len(eval_dataset)}")
     
-    # Tokenize full premise-hypothesis pairs for biased model
     def tokenize_full(examples):
         return tokenizer(
             examples["premise"],
@@ -576,7 +525,6 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
             max_length=max_length
         )
     
-    # Tokenize hypothesis only for bias model
     def tokenize_hypothesis_only(examples):
         return tokenizer(
             examples["hypothesis"],
@@ -585,7 +533,6 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
             max_length=max_length
         )
     
-    print("Tokenizing validation dataset...")
     tokenized_full = eval_dataset.map(
         tokenize_full,
         batched=True,
@@ -597,12 +544,11 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
         num_proc=NUM_PREPROCESSING_WORKERS
     )
     
-    # Get predictions from both models
     print("Getting predictions from biased model...")
     biased_logits = []
     with torch.no_grad():
-        for i in range(0, len(tokenized_full), 32):  # batch size 32
-            batch = tokenized_full[i:i+32]
+        for i in range(0, len(tokenized_full), batch_size):
+            batch = tokenized_full[i:i+batch_size]
             inputs = {
                 'input_ids': torch.tensor(batch['input_ids']).to(device),
                 'attention_mask': torch.tensor(batch['attention_mask']).to(device)
@@ -614,8 +560,8 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     print("Getting predictions from bias model...")
     bias_logits = []
     with torch.no_grad():
-        for i in range(0, len(tokenized_hypo), 32):
-            batch = tokenized_hypo[i:i+32]
+        for i in range(0, len(tokenized_hypo), batch_size):
+            batch = tokenized_hypo[i:i+batch_size]
             inputs = {
                 'input_ids': torch.tensor(batch['input_ids']).to(device),
                 'attention_mask': torch.tensor(batch['attention_mask']).to(device)
@@ -624,32 +570,24 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
             bias_logits.append(outputs.logits.cpu().numpy())
     bias_logits = np.vstack(bias_logits)
     
-    # Ensemble debiasing: subtract weighted bias logits from biased logits
     print(f"Applying ensemble debiasing (alpha={alpha})...")
     debiased_logits = biased_logits - alpha * bias_logits
     
-    # Get predictions
     biased_preds = np.argmax(biased_logits, axis=1)
     bias_preds = np.argmax(bias_logits, axis=1)
     debiased_preds = np.argmax(debiased_logits, axis=1)
     
-    # Get true labels
     true_labels = np.array(eval_dataset['label'])
     
-    # Calculate accuracies
     biased_acc = accuracy_score(true_labels, biased_preds)
     bias_acc = accuracy_score(true_labels, bias_preds)
     debiased_acc = accuracy_score(true_labels, debiased_preds)
     
-    # Calculate metrics for debiased model
     precision, recall, f1, _ = precision_recall_fscore_support(
         true_labels, debiased_preds, average='weighted'
     )
     
-    # Print results
-    print("\n" + "=" * 60)
-    print("ENSEMBLE DEBIASING RESULTS")
-    print("=" * 60)
+    print_title("Ensemble Debiasing Results")
     print(f"Bias-only model accuracy:     {bias_acc:.4f}")
     print(f"Biased model accuracy:        {biased_acc:.4f}")
     print(f"Debiased model accuracy:      {debiased_acc:.4f}")
@@ -657,24 +595,19 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     print(f"  Precision: {precision:.4f}")
     print(f"  Recall:    {recall:.4f}")
     print(f"  F1:        {f1:.4f}")
-    print("=" * 60)
+    print_footer()
     
-    # Per-class performance for debiased model
-    print("\n" + "=" * 60)
-    print("DEBIASED MODEL - PER-CLASS PERFORMANCE")
-    print("=" * 60)
+    print_title("Debiased Model - Per-Class Performance")
     print(classification_report(
         true_labels,
         debiased_preds,
         target_names=['Entailment', 'Neutral', 'Contradiction'],
         digits=4
     ))
-    print("=" * 60)
+    print_footer()
     
-    # Save results
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save comparison metrics
     comparison_file = os.path.join(output_dir, 'debiasing_comparison.json')
     comparison_results = {
         'alpha': alpha,
@@ -688,14 +621,12 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
     }
     with open(comparison_file, 'w') as f:
         json.dump(comparison_results, f, indent=2)
-    print(f"\n✓ Comparison metrics saved to: {comparison_file}")
+    print(f"\nComparison metrics saved to: {comparison_file}")
     
-    # Save debiased logits
     logits_file = os.path.join(output_dir, 'debiased_logits.npy')
     np.save(logits_file, debiased_logits)
-    print(f"✓ Debiased logits saved to: {logits_file}")
+    print(f"Debiased logits saved to: {logits_file}")
     
-    # Save detailed predictions
     predictions_file = os.path.join(output_dir, 'debiased_predictions.jsonl')
     with open(predictions_file, 'w') as f:
         for i, example in enumerate(eval_dataset):
@@ -710,22 +641,20 @@ def ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alp
                 'debiased_correct': int(debiased_preds[i]) == int(example['label'])
             }
             f.write(json.dumps(pred_data) + '\n')
-    print(f"✓ Detailed predictions saved to: {predictions_file}")
+    print(f"Detailed predictions saved to: {predictions_file}")
     
     print_footer()
     
     return comparison_results
 
 def main():
-    # Check for version flag early (before parsing all arguments)
     import sys
+    
     if '--check_versions' in sys.argv:
         check_versions()
         return
     
-    # Check for ensemble debiasing flag early
     if '--ensemble_debias' in sys.argv:
-        # Get required parameters
         if '--biased_model' not in sys.argv or '--bias_model' not in sys.argv:
             print("Error: --ensemble_debias requires --biased_model and --bias_model")
             print("Usage: python run.py --ensemble_debias --biased_model <path> --bias_model <path> [--output_dir <dir>] [--alpha <float>]")
@@ -737,7 +666,6 @@ def main():
         biased_model_path = sys.argv[biased_idx + 1]
         bias_model_path = sys.argv[bias_idx + 1]
         
-        # Get optional parameters
         output_dir = './debiased_model_eval'
         if '--output_dir' in sys.argv:
             output_idx = sys.argv.index('--output_dir')
@@ -759,18 +687,15 @@ def main():
         ensemble_debias_evaluate(biased_model_path, bias_model_path, output_dir, alpha, max_length)
         return
     
-    # Check for evaluate bias model flag early
     if '--eval_bias_model' in sys.argv:
         idx = sys.argv.index('--eval_bias_model')
         if idx + 1 < len(sys.argv):
             model_path = sys.argv[idx + 1]
-            # Get output directory
             output_dir = './bias_model_eval'
             if '--output_dir' in sys.argv:
                 output_idx = sys.argv.index('--output_dir')
                 if output_idx + 1 < len(sys.argv):
                     output_dir = sys.argv[output_idx + 1]
-            # Get max_length if specified
             max_length = 128
             if '--max_length' in sys.argv:
                 max_len_idx = sys.argv.index('--max_length')
@@ -783,12 +708,10 @@ def main():
             print("Usage: python run.py --eval_bias_model <model_path> [--output_dir <dir>] [--max_length <int>]")
         return
     
-    # Check for analyze_overlap flag early
     if '--analyze_overlap' in sys.argv:
         idx = sys.argv.index('--analyze_overlap')
         if idx + 1 < len(sys.argv):
             predictions_file = sys.argv[idx + 1]
-            # Check for optional output file
             output_file = None
             if '--analysis_output' in sys.argv:
                 output_idx = sys.argv.index('--analysis_output')
@@ -800,12 +723,10 @@ def main():
             print("Usage: python run.py --analyze_overlap <predictions.jsonl> [--analysis_output <output.json>]")
         return
     
-    # Check for analyze_hypothesis_bias flag early
     if '--analyze_hypothesis_bias' in sys.argv:
         idx = sys.argv.index('--analyze_hypothesis_bias')
         if idx + 1 < len(sys.argv):
             predictions_file = sys.argv[idx + 1]
-            # Check for optional output file
             output_file = None
             if '--analysis_output' in sys.argv:
                 output_idx = sys.argv.index('--analysis_output')
@@ -817,9 +738,8 @@ def main():
             print("Usage: python run.py --analyze_hypothesis_bias <predictions.jsonl> [--analysis_output <output.json>]")
         return
     
-    argp = HfArgumentParser(TrainingArguments)
     # The HfArgumentParser object collects command-line arguments into an object (and provides default values for unspecified arguments).
-    # In particular, TrainingArguments has several keys that you'll need/want to specify (when you call run.py from the command line):
+    # Standard TrainingArguments keys that you'll need/want to specify when calling run.py from the command line:
     # --do_train
     #     When included, this argument tells the script to train a model.
     #     See docstrings for "--task" and "--dataset" for how the training dataset is selected.
@@ -834,93 +754,88 @@ def main():
     # --output_dir <path>
     #     Where to put the trained model checkpoint(s) and any eval predictions.
     #     *This argument is required*.
-
+    argp = HfArgumentParser(TrainingArguments)
+    
+    # Custom arguments for analysis and utilities
     argp.add_argument('--check_versions', action='store_true',
-                      help='Print version information and exit.')
+                      help='Print PyTorch, Transformers, and CUDA version information and exit.')
+    
+    # Ensemble debiasing arguments
     argp.add_argument('--ensemble_debias', action='store_true',
-                      help='Perform ensemble debiasing using biased and bias models.')
+                      help='Perform ensemble debiasing evaluation using a biased (full) model and a bias (hypothesis-only) model.')
     argp.add_argument('--biased_model', type=str, default=None,
-                      help='Path to biased (full) model for ensemble debiasing.')
+                      help='Path to the biased (full) model checkpoint for ensemble debiasing. Required when --ensemble_debias is used.')
     argp.add_argument('--bias_model', type=str, default=None,
-                      help='Path to bias (hypothesis-only) model for ensemble debiasing.')
+                      help='Path to the bias (hypothesis-only) model checkpoint for ensemble debiasing. Required when --ensemble_debias is used.')
     argp.add_argument('--alpha', type=float, default=1.0,
-                      help='Weight for bias model logits in ensemble debiasing (default=1.0).')
+                      help='Weight (alpha) for the bias model logits in ensemble debiasing. Higher values increase debiasing strength. Default=1.0.')
+    
+    # Bias model evaluation
     argp.add_argument('--eval_bias_model', type=str, default=None,
-                      help='Evaluate hypothesis-only bias model and save predictions.')
+                      help='Evaluate a hypothesis-only bias model and save predictions. Provide path to the trained bias model checkpoint.')
+    
+    # Artifact analysis tools
     argp.add_argument('--analyze_overlap', type=str, default=None,
-                      help='Analyze lexical overlap in predictions file and exit.')
+                      help='Analyze lexical overlap artifacts in a predictions file (JSONL format). Provide path to predictions file and exit after analysis.')
     argp.add_argument('--analyze_hypothesis_bias', type=str, default=None,
-                      help='Analyze hypothesis-only biases (negation, length) in predictions file and exit.')
+                      help='Analyze hypothesis-only biases (negation words, sentence length) in a predictions file (JSONL format). Provide path to predictions file and exit.')
     argp.add_argument('--analysis_output', type=str, default=None,
-                      help='Optional: Save analysis results to JSON file.')
+                      help='Optional: Specify output JSON file path for saving analysis results from --analyze_overlap or --analyze_hypothesis_bias.')
+    
+    # Model and task configuration
     argp.add_argument('--model', type=str,
                       default='google/electra-small-discriminator',
-                      help="""This argument specifies the base model to fine-tune.
-        This should either be a HuggingFace model ID (see https://huggingface.co/models)
-        or a path to a saved model checkpoint (a folder containing config.json and pytorch_model.bin).""")
+                      help="""Base model to fine-tune. This should be either:
+        - A HuggingFace model ID (e.g., 'google/electra-small-discriminator')
+        - A path to a saved model checkpoint directory (containing config.json and pytorch_model.bin)
+        Default: 'google/electra-small-discriminator'""")
     argp.add_argument('--task', type=str, choices=['nli', 'qa'], required=True,
-                      help="""This argument specifies which task to train/evaluate on.
-        Pass "nli" for natural language inference or "qa" for question answering.
-        By default, "nli" will use the SNLI dataset, and "qa" will use the SQuAD dataset.""")
+                      help="""Task to train/evaluate on:
+        - 'nli': Natural Language Inference (default dataset: SNLI)
+        - 'qa': Question Answering (default dataset: SQuAD)""")
     argp.add_argument('--dataset', type=str, default=None,
-                      help="""This argument overrides the default dataset used for the specified task.""")
+                      help='Override the default dataset for the specified task. Format: "dataset_name" or "dataset_name:subset"')
+    
+    # Tokenization and data limits
     argp.add_argument('--max_length', type=int, default=128,
-                      help="""This argument limits the maximum sequence length used during training/evaluation.
-        Shorter sequence lengths need less memory and computation time, but some examples may end up getting truncated.""")
+                      help='Maximum sequence length for tokenization. Sequences longer than this will be truncated. Default=128.')
     argp.add_argument('--max_train_samples', type=int, default=None,
-                      help='Limit the number of examples to train on.')
+                      help='Limit the number of training examples. Useful for quick experiments or debugging.')
     argp.add_argument('--max_eval_samples', type=int, default=None,
-                      help='Limit the number of examples to evaluate on.')
+                      help='Limit the number of evaluation examples. Useful for quick experiments or debugging.')
+    
+    # Bias model training and debiasing
     argp.add_argument('--hypothesis_only', action='store_true',
-                      help='Train on hypothesis only (for bias model).')
+                      help='Train on hypothesis only (ignoring premise). Used to train a bias model that learns hypothesis-only patterns.')
     argp.add_argument('--bias_model_path', type=str, default=None,
-                      help='Path to bias model for ensemble debiasing.')
+                      help='Path to a trained bias model checkpoint. When provided, uses DebiasedTrainer with loss reweighting during training.')
+    
+    # Post-hoc debiasing
     argp.add_argument('--post_hoc_training', action='store_true',
-                      help='Fine-tune an existing model on low-overlap examples only (overlap < 0.35).')
+                      help='Fine-tune an existing trained model on only low-overlap examples (post-hoc debiasing). Requires --model to point to a trained checkpoint.')
     argp.add_argument('--overlap_threshold', type=float, default=0.35,
-                      help='Overlap threshold for post-hoc training (default=0.35).')
+                      help='Lexical overlap threshold for post-hoc training. Only examples with overlap < threshold are used. Default=0.35.')
 
     training_args, args = argp.parse_args_into_dataclasses()
 
-    # Dataset selection
-    # IMPORTANT: this code path allows you to load custom datasets different from the standard SQuAD or SNLI ones.
-    # You need to format the dataset appropriately. For SNLI, you can prepare a file with each line containing one
-    # example as follows:
-    # {"premise": "Two women are embracing.", "hypothesis": "The sisters are hugging.", "label": 1}
-    if args.dataset.endswith('.json') or args.dataset.endswith('.jsonl'):
-        dataset_id = None
-        # Load from local json/jsonl file
-        dataset = datasets.load_dataset('json', data_files=args.dataset)
-        # By default, the "json" dataset loader places all examples in the train split,
-        # so if we want to use a jsonl file for evaluation we need to get the "train" split
-        # from the loaded dataset
-        eval_split = 'train'
-    else:
-        default_datasets = {'qa': ('squad',), 'nli': ('snli',)}
-        dataset_id = tuple(args.dataset.split(':')) if args.dataset is not None else \
-            default_datasets[args.task]
-        # MNLI has two validation splits (one with matched domains and one with mismatched domains). Most datasets just have one "validation" split
-        eval_split = 'validation_matched' if dataset_id == ('glue', 'mnli') else 'validation'
-        # Load the raw data
-        dataset = datasets.load_dataset(*dataset_id)
+    default_datasets = {'qa': ('squad',), 'nli': ('snli',)}
+    dataset_id = tuple(args.dataset.split(':')) if args.dataset is not None else default_datasets[args.task]
+    eval_split = 'validation_matched' if dataset_id == ('glue', 'mnli') else 'validation'
+    dataset = datasets.load_dataset(*dataset_id)
     
-    # NLI models need to have the output label count specified (label 0 is "entailed", 1 is "neutral", and 2 is "contradiction")
     task_kwargs = {'num_labels': 3} if args.task == 'nli' else {}
 
-    # Here we select the right model fine-tuning head
     model_classes = {'qa': AutoModelForQuestionAnswering,
                      'nli': AutoModelForSequenceClassification}
     model_class = model_classes[args.task]
-    # Initialize the model and tokenizer from the specified pretrained model/checkpoint
+    
     model = model_class.from_pretrained(args.model, **task_kwargs)
-    # Make tensor contiguous if needed https://github.com/huggingface/transformers/issues/28293
     if hasattr(model, 'electra'):
         for param in model.electra.parameters():
             if not param.is_contiguous():
                 param.data = param.data.contiguous()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
-    # Validation for post-hoc training
     if args.post_hoc_training:
         if args.model == 'google/electra-small-discriminator':
             raise ValueError(
@@ -941,40 +856,35 @@ def main():
             for param in bias_model.electra.parameters():
                 if not param.is_contiguous():
                     param.data = param.data.contiguous()
-        # Move bias model to the same device as the main model
         bias_model = bias_model.to(model.device)
 
-    # Select the dataset preprocessing function (these functions are defined in helpers.py)
     if args.task == 'qa':
         prepare_train_dataset = lambda exs: prepare_train_dataset_qa(exs, tokenizer)
         prepare_eval_dataset = lambda exs: prepare_validation_dataset_qa(exs, tokenizer)
     elif args.task == 'nli':
         if args.hypothesis_only:
-            # For bias model: only use hypothesis
             prepare_train_dataset = prepare_eval_dataset = \
                 lambda exs: prepare_dataset_nli_hypothesis_only(exs, tokenizer, args.max_length)
         else:
             prepare_train_dataset = prepare_eval_dataset = \
                 lambda exs: prepare_dataset_nli(exs, tokenizer, args.max_length)
-            # prepare_eval_dataset = prepare_dataset_nli
     else:
         raise ValueError('Unrecognized task name: {}'.format(args.task))
 
     print("Preprocessing data... (this takes a little bit, should only happen once per dataset)")
     if dataset_id == ('snli',):
-        # remove SNLI examples with no label
         dataset = dataset.filter(lambda ex: ex['label'] != -1)
     
     train_dataset = None
     eval_dataset = None
     train_dataset_featurized = None
     eval_dataset_featurized = None
+    
     if training_args.do_train:
         train_dataset = dataset['train']
         if args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
         
-        # Apply post-hoc training filter if requested
         if args.post_hoc_training:
             print_title("Post-Hoc Training: Low-Overlap Examples")
             print(f"Filtering training data to overlap < {args.overlap_threshold}")
@@ -991,6 +901,7 @@ def main():
             num_proc=NUM_PREPROCESSING_WORKERS,
             remove_columns=train_dataset.column_names
         )
+    
     if training_args.do_eval:
         eval_dataset = dataset[eval_split]
         if args.max_eval_samples:
@@ -1002,26 +913,19 @@ def main():
             remove_columns=eval_dataset.column_names
         )
 
-    # Select the training configuration
     trainer_class = Trainer
     eval_kwargs = {}
-    # If you want to use custom metrics, you should define your own "compute_metrics" function.
-    # For an example of a valid compute_metrics function, see compute_accuracy in helpers.py.
     compute_metrics = None
+    
     if args.task == 'qa':
-        # For QA, we need to use a tweaked version of the Trainer (defined in helpers.py)
-        # to enable the question-answering specific evaluation metrics
         trainer_class = QuestionAnsweringTrainer
         eval_kwargs['eval_examples'] = eval_dataset
-        metric = evaluate.load('squad')   # datasets.load_metric() deprecated
+        metric = evaluate.load('squad')
         compute_metrics = lambda eval_preds: metric.compute(
             predictions=eval_preds.predictions, references=eval_preds.label_ids)
     elif args.task == 'nli':
         compute_metrics = compute_accuracy
-    
 
-    # This function wraps the compute_metrics function, storing the model's predictions
-    # so that they can be dumped along with the computed metrics
     eval_predictions = None
     def compute_metrics_and_store_predictions(eval_preds):
         nonlocal eval_predictions
@@ -1048,9 +952,7 @@ def main():
             compute_metrics=compute_metrics_and_store_predictions
         )
     
-    # Train and/or evaluate
     if training_args.do_train:
-        # Check for existing checkpoints to resume from, total life saver so I don't keep rerunning from the beginning
         checkpoint = None
         if os.path.isdir(training_args.output_dir):
             checkpoints = [d for d in os.listdir(training_args.output_dir) 
@@ -1062,22 +964,9 @@ def main():
     
         trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()
-        # If you want to customize the way the loss is computed, you should subclass Trainer and override the "compute_loss"
-        # method (see https://huggingface.co/transformers/_modules/transformers/trainer.html#Trainer.compute_loss).
-        #
-        # You can also add training hooks using Trainer.add_callback:
-        #   See https://huggingface.co/transformers/main_classes/trainer.html#transformers.Trainer.add_callback
-        #   and https://huggingface.co/transformers/main_classes/callback.html#transformers.TrainerCallback
 
     if training_args.do_eval:
         results = trainer.evaluate(**eval_kwargs)
-
-        # To add custom metrics, you should replace the "compute_metrics" function (see comments above).
-        #
-        # If you want to change how predictions are computed, you should subclass Trainer and override the "prediction_step"
-        # method (see https://huggingface.co/transformers/_modules/transformers/trainer.html#Trainer.prediction_step).
-        # If you do this your custom prediction_step should probably start by calling super().prediction_step and modifying the
-        # values that it returns.
 
         print('Evaluation results:')
         print(results)
