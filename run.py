@@ -1,6 +1,6 @@
 """
 CS388 NLP Final Project: Dataset Artifact Analysis
-Author: Darin Beaudreau
+Author: Darin Dishneau
 """
 
 import datasets
