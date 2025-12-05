@@ -23,6 +23,41 @@ def print_title(title):
 def print_footer():
     print("=" * 20)
 
+def calculate_word_overlap(premise, hypothesis):
+    """Calculate word overlap between premise and hypothesis."""
+    p_words = set(premise.lower().split())
+    h_words = set(hypothesis.lower().split())
+    if len(h_words) == 0:
+        return 0.0
+    return len(p_words & h_words) / len(h_words)
+
+def filter_by_overlap(dataset, threshold=0.35, keep_below=True):
+    """
+    Filter dataset by lexical overlap.
+    
+    Args:
+        dataset: HuggingFace dataset
+        threshold: Overlap threshold (default 0.35)
+        keep_below: If True, keep examples with overlap < threshold
+                   If False, keep examples with overlap >= threshold
+    
+    Returns:
+        Filtered dataset
+    """
+    print(f"Filtering dataset by overlap {'<' if keep_below else '>='} {threshold}")
+    print(f"Original dataset size: {len(dataset)}")
+    
+    def compute_overlap(example):
+        overlap = calculate_word_overlap(example['premise'], example['hypothesis'])
+        if keep_below:
+            return overlap < threshold
+        else:
+            return overlap >= threshold
+    
+    filtered = dataset.filter(compute_overlap)
+    print(f"Filtered dataset size: {len(filtered)} ({len(filtered)/len(dataset)*100:.1f}% retained)")
+    return filtered
+
 def check_versions():
     print_title("Version and GPU Information")
     print(f"PyTorch version:      {torch.__version__}")
@@ -840,6 +875,10 @@ def main():
                       help='Train on hypothesis only (for bias model).')
     argp.add_argument('--bias_model_path', type=str, default=None,
                       help='Path to bias model for ensemble debiasing.')
+    argp.add_argument('--post_hoc_training', action='store_true',
+                      help='Fine-tune an existing model on low-overlap examples only (overlap < 0.35).')
+    argp.add_argument('--overlap_threshold', type=float, default=0.35,
+                      help='Overlap threshold for post-hoc training (default=0.35).')
 
     training_args, args = argp.parse_args_into_dataclasses()
 
@@ -880,6 +919,18 @@ def main():
             if not param.is_contiguous():
                 param.data = param.data.contiguous()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+
+    # Validation for post-hoc training
+    if args.post_hoc_training:
+        if args.model == 'google/electra-small-discriminator':
+            raise ValueError(
+                "Post-hoc training requires loading a trained model checkpoint. "
+                "Use --model <path_to_trained_model> instead of the base ELECTRA model."
+            )
+        print_title("Post-Hoc Training Mode")
+        print(f"Loading trained model from: {args.model}")
+        print(f"Will fine-tune on low-overlap examples (overlap < {args.overlap_threshold})")
+        print_footer()
 
     bias_model = None
     if args.bias_model_path:
@@ -922,6 +973,18 @@ def main():
         train_dataset = dataset['train']
         if args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
+        
+        # Apply post-hoc training filter if requested
+        if args.post_hoc_training:
+            print_title("Post-Hoc Training: Low-Overlap Examples")
+            print(f"Filtering training data to overlap < {args.overlap_threshold}")
+            train_dataset = filter_by_overlap(
+                train_dataset, 
+                threshold=args.overlap_threshold, 
+                keep_below=True
+            )
+            print_footer()
+        
         train_dataset_featurized = train_dataset.map(
             prepare_train_dataset,
             batched=True,
